@@ -1,6 +1,6 @@
 """Libary for plotting pabot process usage"""
+import argparse
 import re
-import sys
 from datetime import datetime, timedelta
 
 import numpy as np
@@ -66,7 +66,7 @@ def draw_ascii_chart_horizontal(
         print(line)
 
 
-def print_longest_tests(longest_tests, count=10):
+def print_longest_tests(longest_tests):
     """
     Prints the top longest running tests with their durations.
 
@@ -84,12 +84,12 @@ def print_longest_tests(longest_tests, count=10):
     print("-" * 50)
     print(f"{'Test Name':<35} {'Duration (s)':>12}")
     print("-" * 50)
-    for name, duration in longest_tests[:count]:
+    for name, duration in longest_tests:
         print(f"{name:<35} {duration:>12.2f}")
     print("-" * 50)
 
 
-def load_log_file():
+def load_log_file(log_path):
     """
     Loads a log file specified as a command-line argument and returns its
     contents as a list of lines.
@@ -103,11 +103,6 @@ def load_log_file():
     Raises:
     SystemExit: If no log file is provided as an argument.
     """
-    if len(sys.argv) < 2:
-        print("Usage: python yourscript.py <logfile>")
-        sys.exit(1)
-
-    log_path = sys.argv[1]
     with open(log_path, "r", encoding='utf-8') as file:
         log_lines = file.readlines()
     return log_lines
@@ -181,9 +176,38 @@ def build_timeline(starts, ends, durations):
     return timeline
 
 
+def parse_args():
+    """
+    Parse command line arguments.
+
+    Parameters:
+
+    Returns:
+    args: dictionary of command line arguments
+    """
+    parser = argparse.ArgumentParser(
+        description="Plot pabot process usage and show longest tests"
+    )
+    parser.add_argument(
+        "-c", "--count",
+        help="Number of longest tests to display",
+        type=int,
+        default=0
+    )
+
+    parser.add_argument(
+        "logfile",
+        help="Path to pabot log file"
+    )
+
+    args = parser.parse_args()
+    return args
+
+
 def main():
     """main function"""
-    log_lines = load_log_file()
+    arguments = parse_args()
+    log_lines = load_log_file(arguments.logfile)
     starts, ends, durations = parse_log_lines(log_lines)
     timeline = build_timeline(starts, ends, durations)
 
@@ -204,7 +228,9 @@ def main():
             parallel_counts.append((time_cursor, active))
             time_cursor += interval
 
-        longest_tests = sorted(durations.items(), key=lambda x: -x[1])[:10]
+        longest_tests = sorted(durations.items(), key=lambda x: -x[1])
+        if arguments.count != 0:
+            longest_tests = longest_tests[: arguments.count]
         parallel_df = pd.DataFrame(
             parallel_counts, columns=["Timestamp", "ParallelTests"]
         )
