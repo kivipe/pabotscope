@@ -1,6 +1,8 @@
 """Libary for plotting pabot process usage"""
+
 import argparse
 import re
+import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
 
 import numpy as np
@@ -103,7 +105,7 @@ def load_log_file(log_path):
     Raises:
     SystemExit: If no log file is provided as an argument.
     """
-    with open(log_path, "r", encoding='utf-8') as file:
+    with open(log_path, "r", encoding="utf-8") as file:
         log_lines = file.readlines()
     return log_lines
 
@@ -150,6 +152,79 @@ def parse_log_lines(log_lines):
     return starts, ends, durations
 
 
+def parse_status_times(status):
+    """
+    Reads start time and duration from a Robot Framework status element.
+
+    Parameters:
+    status (Element): A <status> element from output.xml.
+
+    Returns:
+    tuple: A tuple containing start time (datetime) and duration in seconds (float),
+    or (None, None) if the element has no timing information.
+
+    Raises:
+    ValueError: If the timestamp format is incorrect.
+    """
+    # Robot Framework 7+ format: start="2025-10-03T13:20:05.472000" elapsed="1.002000"
+    if status.get("start") is not None:
+        start = datetime.fromisoformat(status.get("start"))
+        return start, float(status.get("elapsed", 0))
+    # Robot Framework < 7 format: starttime="20251003 13:20:05.472" endtime="..."
+    starttime = status.get("starttime")
+    endtime = status.get("endtime")
+    if starttime and starttime != "N/A" and endtime and endtime != "N/A":
+        start = datetime.strptime(starttime, "%Y%m%d %H:%M:%S.%f")
+        end = datetime.strptime(endtime, "%Y%m%d %H:%M:%S.%f")
+        return start, (end - start).total_seconds()
+    return None, None
+
+
+def parse_output_xml(xml_path):
+    """
+    Parses Robot Framework output.xml to extract start times, end times and
+    durations of the suites executed by pabot. Pabot runs each lowest level
+    suite in its own process, so only suites without child suites are
+    included.
+
+    Parameters:
+    xml_path (str): Path to output.xml file.
+
+    Returns:
+    tuple: A tuple containing three dictionaries - starts, ends, and durations of suites.
+
+    Raises:
+    xml.etree.ElementTree.ParseError: If the file is not valid XML.
+    """
+    root = ET.parse(xml_path).getroot()
+
+    starts = {}
+    ends = {}
+    durations = {}
+
+    def visit(suite, parent_name):
+        name = suite.get("name")
+        full_name = f"{parent_name}.{name}" if parent_name else name
+        children = suite.findall("suite")
+        if children:
+            for child in children:
+                visit(child, full_name)
+            return
+        status = suite.find("status")
+        if status is None:
+            return
+        start, duration = parse_status_times(status)
+        if start is None:
+            return
+        starts[full_name] = start
+        ends[full_name] = start + timedelta(seconds=duration)
+        durations[full_name] = duration
+
+    for suite in root.findall("suite"):
+        visit(suite, "")
+    return starts, ends, durations
+
+
 def build_timeline(starts, ends, durations):
     """
     Constructs a timeline of test events based on their start and end times.
@@ -189,54 +264,102 @@ def parse_args():
         description="Plot pabot process usage and show longest tests"
     )
     parser.add_argument(
-        "-c", "--count",
-        help="Number of longest tests to display",
-        type=int,
-        default=0
+        "-c", "--count", help="Number of longest tests to display", type=int, default=0
+    )
+
+    parser.add_argument(
+        "-t",
+        "--text",
+        help="Read pabot text output instead of output.xml",
+        action="store_true",
     )
 
     parser.add_argument(
         "logfile",
-        help="Path to pabot log file"
+        help="Path to output.xml (default: output.xml) or pabot text output when --text is used",
+        nargs="?",
+        default="output.xml",
     )
 
     args = parser.parse_args()
     return args
 
 
+def load_results(arguments):
+    """
+    Loads test start times, end times and durations from the input file.
+
+    Parameters:
+    arguments (Namespace): Parsed command line arguments.
+
+    Returns:
+    tuple: A tuple containing three dictionaries - starts, ends, and durations of tests.
+    """
+    if arguments.text:
+        log_lines = load_log_file(arguments.logfile)
+        return parse_log_lines(log_lines)
+    return parse_output_xml(arguments.logfile)
+
+
+def count_parallel_tests(timeline, starts, ends, durations):
+    """
+    Counts how many tests are running in parallel at one second intervals.
+
+    Parameters:
+    timeline (list): A sorted list of tuples containing (time, event_type, test_name).
+    starts (dict): A dictionary mapping test names to their start times.
+    ends (dict): A dictionary mapping test names to their end times.
+    durations (dict): A dictionary mapping test names to their durations in seconds.
+
+    Returns:
+    list: A list of parallel test counts, one per second.
+    """
+    time_cursor = timeline[0][0]
+    end_time = timeline[-1][0]
+    interval = timedelta(seconds=1)
+    parallel_counts = []
+
+    while time_cursor <= end_time:
+        active = 0
+        for test, s_time in starts.items():
+            e_time = ends.get(test, s_time + timedelta(seconds=durations.get(test, 0)))
+            if s_time <= time_cursor < e_time:
+                active += 1
+        parallel_counts.append((time_cursor, active))
+        time_cursor += interval
+
+    parallel_df = pd.DataFrame(parallel_counts, columns=["Timestamp", "ParallelTests"])
+    return parallel_df["ParallelTests"].tolist()
+
+
+def get_longest_tests(durations, count):
+    """
+    Returns tests sorted by duration, longest first.
+
+    Parameters:
+    durations (dict): A dictionary mapping test names to their durations in seconds.
+    count (int): The number of tests to return, 0 for all.
+
+    Returns:
+    list: A list of (test_name, duration) tuples.
+    """
+    longest_tests = sorted(durations.items(), key=lambda x: -x[1])
+    if count != 0:
+        longest_tests = longest_tests[:count]
+    return longest_tests
+
+
 def main():
     """main function"""
     arguments = parse_args()
-    log_lines = load_log_file(arguments.logfile)
-    starts, ends, durations = parse_log_lines(log_lines)
+    starts, ends, durations = load_results(arguments)
     timeline = build_timeline(starts, ends, durations)
 
     if timeline:
-        time_cursor = timeline[0][0]
-        end_time = timeline[-1][0]
-        interval = timedelta(seconds=1)
-        parallel_counts = []
-
-        while time_cursor <= end_time:
-            active = 0
-            for test, s_time in starts.items():
-                e_time = ends.get(
-                    test, s_time + timedelta(seconds=durations.get(test, 0))
-                )
-                if s_time <= time_cursor < e_time:
-                    active += 1
-            parallel_counts.append((time_cursor, active))
-            time_cursor += interval
-
-        longest_tests = sorted(durations.items(), key=lambda x: -x[1])
-        if arguments.count != 0:
-            longest_tests = longest_tests[: arguments.count]
-        parallel_df = pd.DataFrame(
-            parallel_counts, columns=["Timestamp", "ParallelTests"]
+        draw_ascii_chart_horizontal(
+            count_parallel_tests(timeline, starts, ends, durations)
         )
-
-        draw_ascii_chart_horizontal(parallel_df["ParallelTests"].tolist())
-        print_longest_tests(longest_tests)
+        print_longest_tests(get_longest_tests(durations, arguments.count))
 
 
 if __name__ == "__main__":
